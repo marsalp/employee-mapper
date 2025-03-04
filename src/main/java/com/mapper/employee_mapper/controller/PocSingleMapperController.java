@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.util.Optional;
 
 @RestController
 public class PocSingleMapperController {
@@ -52,7 +53,7 @@ public class PocSingleMapperController {
                 .firstName("Jane")
                 .lastName("Doe")
                 .workEmail("jane.doe@acme.com")
-                .company(company)
+                .company(Optional.ofNullable(company))
                 .addresses(List.of(address1, address2))
                 .build();
     }
