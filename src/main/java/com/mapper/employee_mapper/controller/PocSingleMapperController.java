@@ -57,4 +57,5 @@ public class PocSingleMapperController {
                 .addresses(List.of(address1, address2))
                 .build();
     }
+
 }
