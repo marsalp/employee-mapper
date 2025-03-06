@@ -14,14 +14,16 @@ import java.util.Map;
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
-public class Employee {
+public class Employee implements HasExtraFields {
     private String id;
     private String firstName;
     private String lastName;
     private String email;
-
-    private Company company; // Link to our minimal Company domain
-
-    // A "catch-all" map for extra fields we don't want to hardcode.
+    private Company company;
     private Map<String, Object> extraFields;
+
+    @Override
+    public void setExtraFields(Map<String, Object> extraFields) {
+        this.extraFields = extraFields;
+    }
 }

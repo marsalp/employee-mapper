@@ -14,9 +14,6 @@ import lombok.NoArgsConstructor;
 @Builder
 public class Company {
     private String id;
-    private String name;
+    private String name; // Instead of "legalName"
     private Address address;
-    // e.g. "legalName" from Merge
-
-    // We keep it minimal and avoid replicating everything from the Merge object.
 }

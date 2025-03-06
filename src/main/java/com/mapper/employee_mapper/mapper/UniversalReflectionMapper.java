@@ -1,223 +1,236 @@
 package com.mapper.employee_mapper.mapper;
 
+import com.mapper.employee_mapper.domain.HasExtraFields;
 import lombok.extern.slf4j.Slf4j;
 
 import java.lang.reflect.Field;
 import java.util.*;
 
 /**
- * A universal, reflection-based mapper that transforms a "Merge-like" source object
+ * A universal reflection-based mapper that transforms a "SDK-like" source object
  * into one of our domain objects (Employee, Company, etc.).
  *
- * - We do NOT create separate classes for each mapping.
- * - We rely on the domain classes having an 'extraFields' Map<String, Object>
- *   to store anything that doesn't map directly.
- * - We do minimal checks for nested domain classes (e.g., if the domain field is "Company",
- *   we attempt to recursively map the source subobject into a new "Company" instance).
+ * This version does not handle final fields or custom getter-based reflection
+ * logic. It simply looks for matching fields by name, unwrapping Optionals,
+ * and storing everything unmapped into extraFields.
  */
 @Slf4j
 public class UniversalReflectionMapper {
-    
+
+    private final Map<Class<?>, BaseMappingRegistry> registryMap = new HashMap<>();
+
     /**
-     * The main entry point. Provide:
-     *  - `sourceObject` from the "Merge-like" domain (e.g., SdkEmployee)
-     *  - `targetClass` from our domain (e.g., Employee.class)
-     *
-     *  Returns an instance of `targetClass` with mapped fields.
+     * Fluent method to register a domain class + its mapping registry.
+     * Example usage:
+     *   universalMapper
+     *      .registerMapping(Employee.class, new EmployeeMappingRegistry())
+     *      .registerMapping(Company.class, new CompanyMappingRegistry());
+     */
+    public UniversalReflectionMapper registerMapping(Class<?> domainClass, BaseMappingRegistry registry) {
+        this.registryMap.put(domainClass, registry);
+        return this;
+    }
+
+    /**
+     * Main entry point: maps the given sourceObject (SDK object) to an instance
+     * of the specified domain type.
      */
     public <T> T map(Object sourceObject, Class<T> targetClass) {
         if (sourceObject == null) {
+            log.warn("Source object is null; returning null for {}", targetClass.getSimpleName());
             return null;
         }
         return mapObjectToDomain(sourceObject, targetClass);
     }
 
     /**
-     * Creates an instance of targetClass, then tries to fill
-     * 1) matching fields, 2) handle nested objects recursively,
-     * 3) put anything leftover into 'extraFields' if that exists on the target.
+     * Recursively maps sourceObject → target domain object using reflection.
      */
     private <T> T mapObjectToDomain(Object source, Class<T> targetClass) {
         try {
-            // Instantiate the domain class
-            T targetInstance = targetClass.getDeclaredConstructor().newInstance();
-
-            // We'll keep track of which source field names we successfully mapped
-            Set<String> mappedFields = new HashSet<>();
-
-            // Reflect over the target domain class's fields
-            Field[] targetFields = targetClass.getDeclaredFields();
-            for (Field targetField : targetFields) {
-                targetField.setAccessible(true);
-                String targetFieldName = targetField.getName();
-
-                // See if the source object has a field with the same name
-                Field sourceField = findFieldByName(source.getClass(), targetFieldName);
-                if (sourceField != null) {
-                    sourceField.setAccessible(true);
-                    Object sourceValue = sourceField.get(source);
-                    mappedFields.add(targetFieldName);
-
-                    // We'll handle:
-                    // - direct simple type copy
-                    // - nested domain object
-                    // - collection
-                    // - fallback -> store in extra if mismatch
-                    Object mappedValue = mapValue(sourceValue, targetField.getType());
-                    targetField.set(targetInstance, mappedValue);
+            // Unwrap Optional if present
+            if (source instanceof Optional) {
+                source = ((Optional<?>) source).orElse(null);
+                if (source == null) {
+                    return null;
                 }
             }
 
-            // Now handle leftover source fields (the ones we never matched in the domain).
-            // If the domain has an 'extraFields' field, we store them there.
-            Field extraFieldsField = findFieldByName(targetClass, "extraFields");
-            if (extraFieldsField != null) {
-                extraFieldsField.setAccessible(true);
+            T targetInstance = targetClass.getDeclaredConstructor().newInstance();
+            BaseMappingRegistry registry = registryMap.get(targetClass);
 
-                // We'll gather leftover fields into a map
-                Map<String, Object> extrasMap = new HashMap<>();
-                Field[] sourceFields = source.getClass().getDeclaredFields();
-                for (Field sField : sourceFields) {
-                    sField.setAccessible(true);
-                    String sFieldName = sField.getName();
-                    if (mappedFields.contains(sFieldName)) {
-                        continue; // Already mapped
+            Set<String> mappedDomainFields = new HashSet<>();
+
+            // Reflect over the domain's fields
+            Field[] domainFields = targetClass.getDeclaredFields();
+            for (Field domainField : domainFields) {
+                domainField.setAccessible(true);
+                String domainFieldName = domainField.getName();
+
+                // Determine the SDK field name via registry if present
+                String sdkFieldName = (registry != null)
+                        ? registry.getFieldMappings().getOrDefault(domainFieldName, domainFieldName)
+                        : domainFieldName;
+
+                // Attempt to find a field with that name on the source's class
+                Field sdkField = findFieldByName(source.getClass(), sdkFieldName);
+                if (sdkField != null) {
+                    sdkField.setAccessible(true);
+                    Object sdkValue = sdkField.get(source);
+
+                    // Unwrap if it's an Optional
+                    if (sdkValue instanceof Optional) {
+                        sdkValue = ((Optional<?>) sdkValue).orElse(null);
                     }
-                    Object leftoverValue = sField.get(source);
-                    if (leftoverValue != null) {
-                        // We'll either store it "as is" or transform it into a Map if it's complex
-                        Object leftoverMapped = mapComplexToMap(leftoverValue);
-                        extrasMap.put(sFieldName, leftoverMapped);
+
+                    // If the target field type also has a registry, treat it as nested domain
+                    Object mappedValue;
+                    if (registryMap.containsKey(domainField.getType()) && sdkValue != null) {
+                        mappedValue = mapObjectToDomain(sdkValue, domainField.getType());
+                    } else {
+                        mappedValue = mapValue(sdkValue, domainField.getType());
                     }
+
+                    domainField.set(targetInstance, mappedValue);
+                    mappedDomainFields.add(domainFieldName);
                 }
-                extraFieldsField.set(targetInstance, extrasMap);
+            }
+
+            // For leftover SDK fields, store them in extraFields if domain implements HasExtraFields
+            if (targetInstance instanceof HasExtraFields) {
+                Map<String, Object> leftover = buildLeftoverStructure(source, mappedDomainFields, targetClass);
+                if (!leftover.isEmpty()) {
+                    ((HasExtraFields)targetInstance).setExtraFields(leftover);
+                }
             }
 
             return targetInstance;
         } catch (Exception e) {
-            log.error("Error mapping object of type {} to domain class {}",
-                    source.getClass().getName(), targetClass.getName(), e);
+            log.error("Error mapping from {} to {}",
+                    source.getClass().getSimpleName(), targetClass.getSimpleName(), e);
             return null;
         }
     }
 
     /**
-     * Attempts to map the 'sourceValue' to the 'targetType' (which is the type
-     * of a field in the domain class).
+     * Builds a structure (Map) of leftover fields from the SDK object that were not mapped
+     * to any domain field, storing them in extraFields if applicable.
      */
-    private Object mapValue(Object sourceValue, Class<?> targetType) {
-        if (sourceValue == null) {
-            return null;
-        }
-        Class<?> sourceType = sourceValue.getClass();
+    private Map<String, Object> buildLeftoverStructure(
+            Object source, Set<String> mappedDomainFields, Class<?> domainClass) {
 
-        // If it's a collection, map each element individually
-        if (Collection.class.isAssignableFrom(sourceType)) {
-            Collection<?> srcCollection = (Collection<?>) sourceValue;
-            // We'll return a List if the target is List, or keep it as something else otherwise
-            List<Object> mappedList = new ArrayList<>();
-            for (Object item : srcCollection) {
-                // We check if targetType is something like List<Company> or List<String>?
-                // Reflection doesn't know the generic type. We'll just assume the domain field
-                // is a List of domain objects or we store them as maps if domain doesn't define it.
-                mappedList.add(mapComplexToMap(item));
-            }
-            // If the domain field is a List, return the mappedList directly
-            if (List.class.isAssignableFrom(targetType)) {
-                return mappedList;
-            }
-            // Otherwise, you might do more logic, but let's keep it simple
-            return mappedList;
-        }
+        Map<String, Object> leftover = new LinkedHashMap<>();
+        Field[] sdkFields = source.getClass().getDeclaredFields();
+        for (Field sdkField : sdkFields) {
+            sdkField.setAccessible(true);
+            String sdkFieldName = sdkField.getName();
 
-        // If it's a "simple" type: (String, Number, Boolean, etc.), copy as is
-        if (isSimpleType(sourceType)) {
-            // If the domain field is also a simple type or a String, just cast
-            if (isSimpleType(targetType)) {
-                return sourceValue;
+            if (!didWeMapThisSdkField(sdkFieldName, mappedDomainFields, domainClass)) {
+                try {
+                    Object sdkVal = sdkField.get(source);
+                    leftover.put(sdkFieldName, buildLeftoverValue(sdkVal));
+                } catch (IllegalAccessException e) {
+                    log.warn("Unable to read leftover field {}: {}", sdkFieldName, e.getMessage());
+                }
             }
         }
-
-        // If the domain field is one of our domain classes, recursively map
-        if (isDomainClass(targetType)) {
-            return mapObjectToDomain(sourceValue, targetType);
-        }
-
-        // If none of the above, store as a Map (so we don't lose data)
-        return mapComplexToMap(sourceValue);
+        return leftover;
     }
 
     /**
-     * Turn an object into a map by reflecting its fields (recursively).
-     * We'll do a simpler approach here: reflect all fields into a map.
+     * Checks if a given SDK field name was mapped to any domain field in this class's registry.
      */
-    private Map<String, Object> mapComplexToMap(Object complexValue) {
-        if (complexValue == null) return Collections.emptyMap();
-
-        if (isSimpleType(complexValue.getClass())) {
-            // A "simple" type is returned as-is in a map with a 'value' key, for instance
-            return Map.of("value", complexValue);
+    private boolean didWeMapThisSdkField(String sdkFieldName, Set<String> mappedDomainFields, Class<?> domainClass) {
+        BaseMappingRegistry registry = registryMap.get(domainClass);
+        if (registry == null) {
+            // If no registry, we only map domain fields if domainField == sdkFieldName
+            return mappedDomainFields.contains(sdkFieldName);
         }
-        if (complexValue instanceof Collection) {
-            // Convert each item in the collection
-            Collection<?> coll = (Collection<?>) complexValue;
-            List<Object> mappedList = new ArrayList<>();
+
+        // If we do have a registry, check each domain field we mapped
+        for (String domainFieldName : mappedDomainFields) {
+            String mappedSdkName = registry.getFieldMappings().get(domainFieldName);
+            if (mappedSdkName == null) {
+                // Means domainFieldName -> same name as sdk?
+                if (domainFieldName.equals(sdkFieldName)) {
+                    return true;
+                }
+            } else {
+                if (mappedSdkName.equals(sdkFieldName)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Recursively constructs leftover data for unmapped fields.
+     * - If it's a collection, transform each item.
+     * - If it's a simple type, use it directly.
+     * - Otherwise, reflect its fields into a map.
+     */
+    private Object buildLeftoverValue(Object sdkVal) {
+        if (sdkVal == null) return null;
+
+        // Unwrap Optional
+        if (sdkVal instanceof Optional) {
+            sdkVal = ((Optional<?>) sdkVal).orElse(null);
+            if (sdkVal == null) return null;
+        }
+
+        // If it's a collection, map each element
+        if (sdkVal instanceof Collection) {
+            Collection<?> coll = (Collection<?>) sdkVal;
+            List<Object> resultList = new ArrayList<>();
             for (Object item : coll) {
-                mappedList.add(mapComplexToMap(item));
+                resultList.add(buildLeftoverValue(item));
             }
-            return Map.of("list", mappedList);
+            return resultList;
         }
 
-        Map<String, Object> result = new HashMap<>();
-        Field[] fields = complexValue.getClass().getDeclaredFields();
+        // If it's a "simple" type, return as is
+        if (isSimpleType(sdkVal.getClass())) {
+            return sdkVal;
+        }
+
+        // Otherwise, treat it as a complex object => reflect and build a map
+        Map<String, Object> objMap = new LinkedHashMap<>();
+        Field[] fields = sdkVal.getClass().getDeclaredFields();
         for (Field f : fields) {
             f.setAccessible(true);
             try {
-                Object val = f.get(complexValue);
-                if (val != null) {
-                    if (isSimpleType(val.getClass())) {
-                        result.put(f.getName(), val);
-                    } else if (val instanceof Collection) {
-                        // Convert each item in the collection
-                        Collection<?> c = (Collection<?>) val;
-                        List<Object> subList = new ArrayList<>();
-                        for (Object item : c) {
-                            subList.add(mapComplexToMap(item));
-                        }
-                        result.put(f.getName(), subList);
-                    } else if (isDomainClass(val.getClass())) {
-                        // If it's a domain class, we might want to map it too
-                        // But let's assume if we're converting to a map, we keep it as a map
-                        result.put(f.getName(), mapComplexToMap(val));
-                    } else {
-                        // Another complex object
-                        result.put(f.getName(), mapComplexToMap(val));
-                    }
-                }
-            } catch (IllegalAccessException e) {
-                log.warn("Error reading field {} from {}", f.getName(), complexValue.getClass(), e);
+                Object val = f.get(sdkVal);
+                objMap.put(f.getName(), buildLeftoverValue(val));
+            } catch (Exception e) {
+                objMap.put(f.getName(), "ERROR_READING_FIELD");
             }
         }
-        return result;
+        return objMap;
+    }
+
+    private Field findFieldByName(Class<?> clazz, String fieldName) {
+        try {
+            return clazz.getDeclaredField(fieldName);
+        } catch (NoSuchFieldException e) {
+            return null;
+        }
     }
 
     /**
-     * Utility: find a field by name in a given class (or its superclasses).
+     * If the domain field is e.g. a String, and the SDK value is also a String,
+     * we can directly assign. Otherwise, return null (fallback).
      */
-    private Field findFieldByName(Class<?> clazz, String name) {
-        Class<?> current = clazz;
-        while (current != null && current != Object.class) {
-            try {
-                return current.getDeclaredField(name);
-            } catch (NoSuchFieldException e) {
-                current = current.getSuperclass();
-            }
+    private Object mapValue(Object sourceValue, Class<?> targetType) {
+        if (sourceValue == null) return null;
+        if (targetType.isAssignableFrom(sourceValue.getClass())) {
+            return sourceValue;
         }
         return null;
     }
 
     /**
-     * Check if the class is "simple" (String, Number, Boolean, Character, etc.).
+     * A helper check to see if a class is a "simple" type (String, Number, Boolean, etc.)
      */
     private boolean isSimpleType(Class<?> clazz) {
         return clazz.isPrimitive()
@@ -225,16 +238,7 @@ public class UniversalReflectionMapper {
                 || CharSequence.class.isAssignableFrom(clazz)
                 || Boolean.class.isAssignableFrom(clazz)
                 || Date.class.isAssignableFrom(clazz)
-                || UUID.class.isAssignableFrom(clazz);
-    }
-
-    /**
-     * Check if the class is one of our domain classes (Employee, Company, etc.).
-     * For a simple approach, let's just see if it's in a certain package
-     * or if we keep a set of domain classes.
-     */
-    private boolean isDomainClass(Class<?> clazz) {
-        // Example: if your domain is in package "com.mapper.employee_mapper.domain":
-        return clazz.getPackageName().contains("com.mapper.employee_mapper.domain");
+                || UUID.class.isAssignableFrom(clazz)
+                || clazz.isEnum();
     }
 }
